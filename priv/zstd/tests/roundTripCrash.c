@@ -94,7 +94,7 @@ static size_t cctxParamRoundTripTest(void* resultBuff, size_t resultBuffCapacity
 
     /* Set parameters */
     CHECK_Z( ZSTD_CCtxParam_setParameter(cctxParams, ZSTD_p_compressionLevel, cLevel) );
-    CHECK_Z( ZSTD_CCtxParam_setParameter(cctxParams, ZSTD_p_nbThreads, 2) );
+    CHECK_Z( ZSTD_CCtxParam_setParameter(cctxParams, ZSTD_p_nbWorkers, 2) );
     CHECK_Z( ZSTD_CCtxParam_setParameter(cctxParams, ZSTD_p_overlapSizeLog, 5) );
 
 
@@ -212,7 +212,7 @@ static void loadFile(void* buffer, const char* fileName, size_t fileSize)
 static void fileCheck(const char* fileName, int testCCtxParams)
 {
     size_t const fileSize = getFileSize(fileName);
-    void* buffer = malloc(fileSize);
+    void* const buffer = malloc(fileSize + !fileSize /* avoid 0 */);
     if (!buffer) {
         fprintf(stderr, "not enough memory \n");
         exit(4);

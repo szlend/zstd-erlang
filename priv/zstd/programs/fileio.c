@@ -20,7 +20,6 @@
 #  define _POSIX_SOURCE 1          /* disable %llu warnings with MinGW on Windows */
 #endif
 
-
 /*-*************************************
 *  Includes
 ***************************************/
@@ -29,25 +28,29 @@
 #include <stdio.h>      /* fprintf, fopen, fread, _fileno, stdin, stdout */
 #include <stdlib.h>     /* malloc, free */
 #include <string.h>     /* strcmp, strlen */
+#include <assert.h>
 #include <errno.h>      /* errno */
+#include <signal.h>
 
 #if defined (_MSC_VER)
 #  include <sys/stat.h>
 #  include <io.h>
 #endif
 
-#include "bitstream.h"
-#include "mem.h"
+#include "mem.h"       /* U32, U64 */
 #include "fileio.h"
-#include "util.h"
+
 #define ZSTD_STATIC_LINKING_ONLY   /* ZSTD_magicNumber, ZSTD_frameHeaderSize_max */
 #include "zstd.h"
+#include "zstd_errors.h"           /* ZSTD_error_frameParameter_windowTooLarge */
+
 #if defined(ZSTD_GZCOMPRESS) || defined(ZSTD_GZDECOMPRESS)
 #  include <zlib.h>
 #  if !defined(z_const)
 #    define z_const
 #  endif
 #endif
+
 #if defined(ZSTD_LZMACOMPRESS) || defined(ZSTD_LZMADECOMPRESS)
 #  include <lzma.h>
 #endif
@@ -67,6 +70,7 @@
 #define MB *(1<<20)
 #define GB *(1U<<30)
 
+#define ADAPT_WINDOWLOG_DEFAULT 23   /* 8 MB */
 #define DICTSIZE_MAX (32 MB)   /* protection against large input (attack scenario) */
 
 #define FNSPACE 30
@@ -84,34 +88,24 @@ void FIO_setNotificationLevel(unsigned level) { g_displayLevel=level; }
 static const U64 g_refreshRate = SEC_TO_MICRO / 6;
 static UTIL_time_t g_displayClock = UTIL_TIME_INITIALIZER;
 
-#define DISPLAYUPDATE(l, ...) { if (g_displayLevel>=l) { \
-            if ((UTIL_clockSpanMicro(g_displayClock) > g_refreshRate) || (g_displayLevel>=4)) \
-            { g_displayClock = UTIL_getTime(); DISPLAY(__VA_ARGS__); \
-            if (g_displayLevel>=4) fflush(stderr); } } }
+#define READY_FOR_UPDATE() (UTIL_clockSpanMicro(g_displayClock) > g_refreshRate)
+#define DELAY_NEXT_UPDATE() { g_displayClock = UTIL_getTime(); }
+#define DISPLAYUPDATE(l, ...) {                              \
+        if (g_displayLevel>=l) {                             \
+            if (READY_FOR_UPDATE() || (g_displayLevel>=4)) { \
+                DELAY_NEXT_UPDATE();                         \
+                DISPLAY(__VA_ARGS__);                        \
+                if (g_displayLevel>=4) fflush(stderr);       \
+    }   }   }
 
 #undef MIN  /* in case it would be already defined */
 #define MIN(a,b)    ((a) < (b) ? (a) : (b))
 
 
-/*-*************************************
-*  Debug
-***************************************/
-#if defined(ZSTD_DEBUG) && (ZSTD_DEBUG>=1)
-#  include <assert.h>
-#else
-#  ifndef assert
-#    define assert(condition) ((void)0)
-#  endif
-#endif
-
-#ifndef ZSTD_DEBUG
-#  define ZSTD_DEBUG 0
-#endif
-#define DEBUGLOG(l,...) if (l<=ZSTD_DEBUG) DISPLAY(__VA_ARGS__);
 #define EXM_THROW(error, ...)                                             \
 {                                                                         \
     DISPLAYLEVEL(1, "zstd: ");                                            \
-    DEBUGLOG(1, "Error defined at %s, line %i : \n", __FILE__, __LINE__); \
+    DISPLAYLEVEL(5, "Error defined at %s, line %i : \n", __FILE__, __LINE__); \
     DISPLAYLEVEL(1, "error %i : ", error);                                \
     DISPLAYLEVEL(1, __VA_ARGS__);                                         \
     DISPLAYLEVEL(1, " \n");                                               \
@@ -121,7 +115,7 @@ static UTIL_time_t g_displayClock = UTIL_TIME_INITIALIZER;
 #define CHECK_V(v, f)                                \
     v = f;                                           \
     if (ZSTD_isError(v)) {                           \
-        DEBUGLOG(1, "%s \n", #f);                    \
+        DISPLAYLEVEL(5, "%s \n", #f);                \
         EXM_THROW(11, "%s", ZSTD_getErrorName(v));   \
     }
 #define CHECK(f) { size_t err; CHECK_V(err, f); }
@@ -130,8 +124,6 @@ static UTIL_time_t g_displayClock = UTIL_TIME_INITIALIZER;
 /*-************************************
 *  Signal (Ctrl-C trapping)
 **************************************/
-#include  <signal.h>
-
 static const char* g_artefact = NULL;
 static void INThandler(int sig)
 {
@@ -139,7 +131,10 @@ static void INThandler(int sig)
 #if !defined(_MSC_VER)
     signal(sig, SIG_IGN);  /* this invocation generates a buggy warning in Visual Studio */
 #endif
-    if (g_artefact) remove(g_artefact);
+    if (g_artefact) {
+        assert(UTIL_isRegularFile(g_artefact));
+        remove(g_artefact);
+    }
     DISPLAY("\n");
     exit(2);
 }
@@ -160,8 +155,85 @@ static void clearHandler(void)
 }
 
 
-/* ************************************************************
-* Avoid fseek()'s 2GiB barrier with MSVC, MacOS, *BSD, MinGW
+/*-*********************************************************
+*  Termination signal trapping (Print debug stack trace)
+***********************************************************/
+#if defined(__has_feature) && !defined(BACKTRACE_ENABLE) /* Clang compiler */
+#  if (__has_feature(address_sanitizer))
+#    define BACKTRACE_ENABLE 0
+#  endif /* __has_feature(address_sanitizer) */
+#elif defined(__SANITIZE_ADDRESS__) && !defined(BACKTRACE_ENABLE) /* GCC compiler */
+#  define BACKTRACE_ENABLE 0
+#endif
+
+#if !defined(BACKTRACE_ENABLE)
+/* automatic detector : backtrace enabled by default on linux+glibc and osx */
+#  if (defined(__linux__) && defined(__GLIBC__)) \
+     || (defined(__APPLE__) && defined(__MACH__))
+#    define BACKTRACE_ENABLE 1
+#  else
+#    define BACKTRACE_ENABLE 0
+#  endif
+#endif
+
+/* note : after this point, BACKTRACE_ENABLE is necessarily defined */
+
+
+#if BACKTRACE_ENABLE
+
+#include <execinfo.h>   /* backtrace, backtrace_symbols */
+
+#define MAX_STACK_FRAMES    50
+
+static void ABRThandler(int sig) {
+    const char* name;
+    void* addrlist[MAX_STACK_FRAMES];
+    char** symbollist;
+    U32 addrlen, i;
+
+    switch (sig) {
+        case SIGABRT: name = "SIGABRT"; break;
+        case SIGFPE: name = "SIGFPE"; break;
+        case SIGILL: name = "SIGILL"; break;
+        case SIGINT: name = "SIGINT"; break;
+        case SIGSEGV: name = "SIGSEGV"; break;
+        default: name = "UNKNOWN";
+    }
+
+    DISPLAY("Caught %s signal, printing stack:\n", name);
+    /* Retrieve current stack addresses. */
+    addrlen = backtrace(addrlist, MAX_STACK_FRAMES);
+    if (addrlen == 0) {
+        DISPLAY("\n");
+        return;
+    }
+    /* Create readable strings to each frame. */
+    symbollist = backtrace_symbols(addrlist, addrlen);
+    /* Print the stack trace, excluding calls handling the signal. */
+    for (i = ZSTD_START_SYMBOLLIST_FRAME; i < addrlen; i++) {
+        DISPLAY("%s\n", symbollist[i]);
+    }
+    free(symbollist);
+    /* Reset and raise the signal so default handler runs. */
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+#endif
+
+void FIO_addAbortHandler()
+{
+#if BACKTRACE_ENABLE
+    signal(SIGABRT, ABRThandler);
+    signal(SIGFPE, ABRThandler);
+    signal(SIGILL, ABRThandler);
+    signal(SIGSEGV, ABRThandler);
+    signal(SIGBUS, ABRThandler);
+#endif
+}
+
+
+/*-************************************************************
+* Avoid fseek()'s 2GiB barrier with MSVC, macOS, *BSD, MinGW
 ***************************************************************/
 #if defined(_MSC_VER) && _MSC_VER >= 1400
 #   define LONG_SEEK _fseeki64
@@ -209,26 +281,46 @@ static U32 g_removeSrcFile = 0;
 void FIO_setRemoveSrcFile(unsigned flag) { g_removeSrcFile = (flag>0); }
 static U32 g_memLimit = 0;
 void FIO_setMemLimit(unsigned memLimit) { g_memLimit = memLimit; }
-static U32 g_nbThreads = 1;
-void FIO_setNbThreads(unsigned nbThreads) {
+static U32 g_nbWorkers = 1;
+void FIO_setNbWorkers(unsigned nbWorkers) {
 #ifndef ZSTD_MULTITHREAD
-    if (nbThreads > 1) DISPLAYLEVEL(2, "Note : multi-threading is disabled \n");
+    if (nbWorkers > 0) DISPLAYLEVEL(2, "Note : multi-threading is disabled \n");
 #endif
-    g_nbThreads = nbThreads;
+    g_nbWorkers = nbWorkers;
 }
 static U32 g_blockSize = 0;
 void FIO_setBlockSize(unsigned blockSize) {
-    if (blockSize && g_nbThreads==1)
+    if (blockSize && g_nbWorkers==0)
         DISPLAYLEVEL(2, "Setting block size is useless in single-thread mode \n");
     g_blockSize = blockSize;
 }
 #define FIO_OVERLAP_LOG_NOTSET 9999
 static U32 g_overlapLog = FIO_OVERLAP_LOG_NOTSET;
 void FIO_setOverlapLog(unsigned overlapLog){
-    if (overlapLog && g_nbThreads==1)
+    if (overlapLog && g_nbWorkers==0)
         DISPLAYLEVEL(2, "Setting overlapLog is useless in single-thread mode \n");
     g_overlapLog = overlapLog;
 }
+static U32 g_adaptiveMode = 0;
+void FIO_setAdaptiveMode(unsigned adapt) {
+    if ((adapt>0) && (g_nbWorkers==0))
+        EXM_THROW(1, "Adaptive mode is not compatible with single thread mode \n");
+    g_adaptiveMode = adapt;
+}
+static int g_minAdaptLevel = -50;   /* initializing this value requires a constant, so ZSTD_minCLevel() doesn't work */
+void FIO_setAdaptMin(int minCLevel)
+{
+#ifndef ZSTD_NOCOMPRESS
+    assert(minCLevel >= ZSTD_minCLevel());
+#endif
+    g_minAdaptLevel = minCLevel;
+}
+static int g_maxAdaptLevel = 22;   /* initializing this value requires a constant, so ZSTD_maxCLevel() doesn't work */
+void FIO_setAdaptMax(int maxCLevel)
+{
+    g_maxAdaptLevel = maxCLevel;
+}
+
 static U32 g_ldmFlag = 0;
 void FIO_setLdmFlag(unsigned ldmFlag) {
     g_ldmFlag = (ldmFlag>0);
@@ -392,9 +484,9 @@ static size_t FIO_createDictBuffer(void** bufferPtr, const char* fileName)
 
 #ifndef ZSTD_NOCOMPRESS
 
-/*-**********************************************************************
-*  Compression
-************************************************************************/
+/* **********************************************************************
+ *  Compression
+ ************************************************************************/
 typedef struct {
     FILE* srcFile;
     FILE* dstFile;
@@ -407,10 +499,11 @@ typedef struct {
 
 static cRess_t FIO_createCResources(const char* dictFileName, int cLevel,
                                     U64 srcSize,
-                                    ZSTD_compressionParameters* comprParams) {
+                                    ZSTD_compressionParameters comprParams) {
     cRess_t ress;
     memset(&ress, 0, sizeof(ress));
 
+    DISPLAYLEVEL(6, "FIO_createCResources \n");
     ress.cctx = ZSTD_createCCtx();
     if (ress.cctx == NULL)
         EXM_THROW(30, "allocation error : can't create ZSTD_CCtx");
@@ -421,20 +514,22 @@ static cRess_t FIO_createCResources(const char* dictFileName, int cLevel,
     if (!ress.srcBuffer || !ress.dstBuffer)
         EXM_THROW(31, "allocation error : not enough memory");
 
-    /* Advances parameters, including dictionary */
+    /* Advanced parameters, including dictionary */
     {   void* dictBuffer;
         size_t const dictBuffSize = FIO_createDictBuffer(&dictBuffer, dictFileName);   /* works with dictFileName==NULL */
         if (dictFileName && (dictBuffer==NULL))
             EXM_THROW(32, "allocation error : can't create dictBuffer");
 
+        if (g_adaptiveMode && !g_ldmFlag && !comprParams.windowLog)
+            comprParams.windowLog = ADAPT_WINDOWLOG_DEFAULT;
+
         CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_p_contentSizeFlag, 1) );  /* always enable content size when available (note: supposed to be default) */
         CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_p_dictIDFlag, g_dictIDFlag) );
         CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_p_checksumFlag, g_checksumFlag) );
         /* compression level */
-        CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_p_compressionLevel, cLevel) );
+        CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_p_compressionLevel, (unsigned)cLevel) );
         /* long distance matching */
-        CHECK( ZSTD_CCtx_setParameter(
-                      ress.cctx, ZSTD_p_enableLongDistanceMatching, g_ldmFlag) );
+        CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_p_enableLongDistanceMatching, g_ldmFlag) );
         CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_p_ldmHashLog, g_ldmHashLog) );
         CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_p_ldmMinMatch, g_ldmMinMatch) );
         if (g_ldmBucketSizeLog != FIO_LDM_PARAM_NOTSET) {
@@ -444,18 +539,27 @@ static cRess_t FIO_createCResources(const char* dictFileName, int cLevel,
             CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_p_ldmHashEveryLog, g_ldmHashEveryLog) );
         }
         /* compression parameters */
-        CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_p_windowLog, comprParams->windowLog) );
-        CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_p_chainLog, comprParams->chainLog) );
-        CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_p_hashLog, comprParams->hashLog) );
-        CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_p_searchLog, comprParams->searchLog) );
-        CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_p_minMatch, comprParams->searchLength) );
-        CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_p_targetLength, comprParams->targetLength) );
-        CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_p_compressionStrategy, (U32)comprParams->strategy) );
+        CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_p_windowLog, comprParams.windowLog) );
+        CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_p_chainLog, comprParams.chainLog) );
+        CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_p_hashLog, comprParams.hashLog) );
+        CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_p_searchLog, comprParams.searchLog) );
+        CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_p_minMatch, comprParams.searchLength) );
+        CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_p_targetLength, comprParams.targetLength) );
+        CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_p_compressionStrategy, (U32)comprParams.strategy) );
         /* multi-threading */
-        DISPLAYLEVEL(5,"set nb threads = %u \n", g_nbThreads);
-        CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_p_nbThreads, g_nbThreads) );
+#ifdef ZSTD_MULTITHREAD
+        DISPLAYLEVEL(5,"set nb workers = %u \n", g_nbWorkers);
+        CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_p_nbWorkers, g_nbWorkers) );
+        if ( (g_overlapLog == FIO_OVERLAP_LOG_NOTSET)
+          && (cLevel == ZSTD_maxCLevel()) )
+            g_overlapLog = 9;   /* full overlap */
+        if (g_overlapLog != FIO_OVERLAP_LOG_NOTSET) {
+            DISPLAYLEVEL(3,"set overlapLog = %u \n", g_overlapLog);
+            CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_p_overlapSizeLog, g_overlapLog) );
+        }
+#endif
         /* dictionary */
-        CHECK( ZSTD_CCtx_setPledgedSrcSize(ress.cctx, srcSize) );  /* just for dictionary loading, for compression parameters adaptation */
+        CHECK( ZSTD_CCtx_setPledgedSrcSize(ress.cctx, srcSize) );  /* set the value temporarily for dictionary loading, to adapt compression parameters */
         CHECK( ZSTD_CCtx_loadDictionary(ress.cctx, dictBuffer, dictBuffSize) );
         CHECK( ZSTD_CCtx_setPledgedSrcSize(ress.cctx, ZSTD_CONTENTSIZE_UNKNOWN) );  /* reset */
 
@@ -474,7 +578,8 @@ static void FIO_freeCResources(cRess_t ress)
 
 
 #ifdef ZSTD_GZCOMPRESS
-static unsigned long long FIO_compressGzFrame(cRess_t* ress,
+static unsigned long long
+FIO_compressGzFrame(cRess_t* ress,
                     const char* srcFileName, U64 const srcFileSize,
                     int compressionLevel, U64* readsize)
 {
@@ -556,9 +661,10 @@ static unsigned long long FIO_compressGzFrame(cRess_t* ress,
 
 
 #ifdef ZSTD_LZMACOMPRESS
-static unsigned long long FIO_compressLzmaFrame(cRess_t* ress,
-                            const char* srcFileName, U64 const srcFileSize,
-                            int compressionLevel, U64* readsize, int plain_lzma)
+static unsigned long long
+FIO_compressLzmaFrame(cRess_t* ress,
+                      const char* srcFileName, U64 const srcFileSize,
+                      int compressionLevel, U64* readsize, int plain_lzma)
 {
     unsigned long long inFileSize = 0, outFileSize = 0;
     lzma_stream strm = LZMA_STREAM_INIT;
@@ -631,9 +737,10 @@ static unsigned long long FIO_compressLzmaFrame(cRess_t* ress,
 #define LZ4F_max64KB max64KB
 #endif
 static int FIO_LZ4_GetBlockSize_FromBlockId (int id) { return (1 << (8 + (2 * id))); }
-static unsigned long long FIO_compressLz4Frame(cRess_t* ress,
-                            const char* srcFileName, U64 const srcFileSize,
-                            int compressionLevel, U64* readsize)
+static unsigned long long
+FIO_compressLz4Frame(cRess_t* ress,
+                     const char* srcFileName, U64 const srcFileSize,
+                     int compressionLevel, U64* readsize)
 {
     const size_t blockSize = FIO_LZ4_GetBlockSize_FromBlockId(LZ4F_max64KB);
     unsigned long long inFileSize = 0, outFileSize = 0;
@@ -721,24 +828,213 @@ static unsigned long long FIO_compressLz4Frame(cRess_t* ress,
 #endif
 
 
+static unsigned long long
+FIO_compressZstdFrame(const cRess_t* ressPtr,
+                      const char* srcFileName, U64 fileSize,
+                      int compressionLevel, U64* readsize)
+{
+    cRess_t const ress = *ressPtr;
+    FILE* const srcFile = ress.srcFile;
+    FILE* const dstFile = ress.dstFile;
+    U64 compressedfilesize = 0;
+    ZSTD_EndDirective directive = ZSTD_e_continue;
+
+    /* stats */
+    ZSTD_frameProgression previous_zfp_update = { 0, 0, 0, 0, 0, 0 };
+    ZSTD_frameProgression previous_zfp_correction = { 0, 0, 0, 0, 0, 0 };
+    typedef enum { noChange, slower, faster } speedChange_e;
+    speedChange_e speedChange = noChange;
+    unsigned flushWaiting = 0;
+    unsigned inputPresented = 0;
+    unsigned inputBlocked = 0;
+    unsigned lastJobID = 0;
+
+    DISPLAYLEVEL(6, "compression using zstd format \n");
+
+    /* init */
+    if (fileSize != UTIL_FILESIZE_UNKNOWN) {
+        CHECK(ZSTD_CCtx_setPledgedSrcSize(ress.cctx, fileSize));
+    }
+    (void)srcFileName;
+
+    /* Main compression loop */
+    do {
+        size_t stillToFlush;
+        /* Fill input Buffer */
+        size_t const inSize = fread(ress.srcBuffer, (size_t)1, ress.srcBufferSize, srcFile);
+        ZSTD_inBuffer inBuff = { ress.srcBuffer, inSize, 0 };
+        DISPLAYLEVEL(6, "fread %u bytes from source \n", (U32)inSize);
+        *readsize += inSize;
+
+        if ((inSize == 0) || (*readsize == fileSize))
+            directive = ZSTD_e_end;
+
+        stillToFlush = 1;
+        while ((inBuff.pos != inBuff.size)   /* input buffer must be entirely ingested */
+            || (directive == ZSTD_e_end && stillToFlush != 0) ) {
+
+            size_t const oldIPos = inBuff.pos;
+            ZSTD_outBuffer outBuff = { ress.dstBuffer, ress.dstBufferSize, 0 };
+            size_t const toFlushNow = ZSTD_toFlushNow(ress.cctx);
+            CHECK_V(stillToFlush, ZSTD_compress_generic(ress.cctx, &outBuff, &inBuff, directive));
+
+            /* count stats */
+            inputPresented++;
+            if (oldIPos == inBuff.pos) inputBlocked++;  /* input buffer is full and can't take any more : input speed is faster than consumption rate */
+            if (!toFlushNow) flushWaiting = 1;
+
+            /* Write compressed stream */
+            DISPLAYLEVEL(6, "ZSTD_compress_generic(end:%u) => input pos(%u)<=(%u)size ; output generated %u bytes \n",
+                            (U32)directive, (U32)inBuff.pos, (U32)inBuff.size, (U32)outBuff.pos);
+            if (outBuff.pos) {
+                size_t const sizeCheck = fwrite(ress.dstBuffer, 1, outBuff.pos, dstFile);
+                if (sizeCheck != outBuff.pos)
+                    EXM_THROW(25, "Write error : cannot write compressed block");
+                compressedfilesize += outBuff.pos;
+            }
+
+            /* display notification; and adapt compression level */
+            if (READY_FOR_UPDATE()) {
+                ZSTD_frameProgression const zfp = ZSTD_getFrameProgression(ress.cctx);
+                double const cShare = (double)zfp.produced / (zfp.consumed + !zfp.consumed/*avoid div0*/) * 100;
+
+                /* display progress notifications */
+                if (g_displayLevel >= 3) {
+                    DISPLAYUPDATE(3, "\r(L%i) Buffered :%4u MB - Consumed :%4u MB - Compressed :%4u MB => %.2f%% ",
+                                compressionLevel,
+                                (U32)((zfp.ingested - zfp.consumed) >> 20),
+                                (U32)(zfp.consumed >> 20),
+                                (U32)(zfp.produced >> 20),
+                                cShare );
+                } else {   /* summarized notifications if == 2; */
+                    DISPLAYLEVEL(2, "\rRead : %u ", (U32)(zfp.consumed >> 20));
+                    if (fileSize != UTIL_FILESIZE_UNKNOWN)
+                        DISPLAYLEVEL(2, "/ %u ", (U32)(fileSize >> 20));
+                    DISPLAYLEVEL(2, "MB ==> %2.f%% ", cShare);
+                    DELAY_NEXT_UPDATE();
+                }
+
+                /* adaptive mode : statistics measurement and speed correction */
+                if (g_adaptiveMode) {
+
+                    /* check output speed */
+                    if (zfp.currentJobID > 1) {  /* only possible if nbWorkers >= 1 */
+
+                        unsigned long long newlyProduced = zfp.produced - previous_zfp_update.produced;
+                        unsigned long long newlyFlushed = zfp.flushed - previous_zfp_update.flushed;
+                        assert(zfp.produced >= previous_zfp_update.produced);
+                        assert(g_nbWorkers >= 1);
+
+                        /* test if compression is blocked
+                         * either because output is slow and all buffers are full
+                         * or because input is slow and no job can start while waiting for at least one buffer to be filled.
+                         * note : excluse starting part, since currentJobID > 1 */
+                        if ( (zfp.consumed == previous_zfp_update.consumed)   /* no data compressed : no data available, or no more buffer to compress to, OR compression is really slow (compression of a single block is slower than update rate)*/
+                          && (zfp.nbActiveWorkers == 0)                       /* confirmed : no compression ongoing */
+                          ) {
+                            DISPLAYLEVEL(6, "all buffers full : compression stopped => slow down \n")
+                            speedChange = slower;
+                        }
+
+                        previous_zfp_update = zfp;
+
+                        if ( (newlyProduced > (newlyFlushed * 9 / 8))   /* compression produces more data than output can flush (though production can be spiky, due to work unit : (N==4)*block sizes) */
+                          && (flushWaiting == 0)                        /* flush speed was never slowed by lack of production, so it's operating at max capacity */
+                          ) {
+                            DISPLAYLEVEL(6, "compression faster than flush (%llu > %llu), and flushed was never slowed down by lack of production => slow down \n", newlyProduced, newlyFlushed);
+                            speedChange = slower;
+                        }
+                        flushWaiting = 0;
+                    }
+
+                    /* course correct only if there is at least one new job completed */
+                    if (zfp.currentJobID > lastJobID) {
+                        DISPLAYLEVEL(6, "compression level adaptation check \n")
+
+                        /* check input speed */
+                        if (zfp.currentJobID > g_nbWorkers+1) {   /* warm up period, to fill all workers */
+                            if (inputBlocked <= 0) {
+                                DISPLAYLEVEL(6, "input is never blocked => input is slower than ingestion \n");
+                                speedChange = slower;
+                            } else if (speedChange == noChange) {
+                                unsigned long long newlyIngested = zfp.ingested - previous_zfp_correction.ingested;
+                                unsigned long long newlyConsumed = zfp.consumed - previous_zfp_correction.consumed;
+                                unsigned long long newlyProduced = zfp.produced - previous_zfp_correction.produced;
+                                unsigned long long newlyFlushed  = zfp.flushed  - previous_zfp_correction.flushed;
+                                previous_zfp_correction = zfp;
+                                assert(inputPresented > 0);
+                                DISPLAYLEVEL(6, "input blocked %u/%u(%.2f) - ingested:%u vs %u:consumed - flushed:%u vs %u:produced \n",
+                                                inputBlocked, inputPresented, (double)inputBlocked/inputPresented*100,
+                                                (U32)newlyIngested, (U32)newlyConsumed,
+                                                (U32)newlyFlushed, (U32)newlyProduced);
+                                if ( (inputBlocked > inputPresented / 8)     /* input is waiting often, because input buffers is full : compression or output too slow */
+                                  && (newlyFlushed * 33 / 32 > newlyProduced)  /* flush everything that is produced */
+                                  && (newlyIngested * 33 / 32 > newlyConsumed) /* input speed as fast or faster than compression speed */
+                                ) {
+                                    DISPLAYLEVEL(6, "recommend faster as in(%llu) >= (%llu)comp(%llu) <= out(%llu) \n",
+                                                    newlyIngested, newlyConsumed, newlyProduced, newlyFlushed);
+                                    speedChange = faster;
+                                }
+                            }
+                            inputBlocked = 0;
+                            inputPresented = 0;
+                        }
+
+                        if (speedChange == slower) {
+                            DISPLAYLEVEL(6, "slower speed , higher compression \n")
+                            compressionLevel ++;
+                            if (compressionLevel > ZSTD_maxCLevel()) compressionLevel = ZSTD_maxCLevel();
+                            if (compressionLevel > g_maxAdaptLevel) compressionLevel = g_maxAdaptLevel;
+                            compressionLevel += (compressionLevel == 0);   /* skip 0 */
+                            ZSTD_CCtx_setParameter(ress.cctx, ZSTD_p_compressionLevel, (unsigned)compressionLevel);
+                        }
+                        if (speedChange == faster) {
+                            DISPLAYLEVEL(6, "faster speed , lighter compression \n")
+                            compressionLevel --;
+                            if (compressionLevel < g_minAdaptLevel) compressionLevel = g_minAdaptLevel;
+                            compressionLevel -= (compressionLevel == 0);   /* skip 0 */
+                            ZSTD_CCtx_setParameter(ress.cctx, ZSTD_p_compressionLevel, (unsigned)compressionLevel);
+                        }
+                        speedChange = noChange;
+
+                        lastJobID = zfp.currentJobID;
+                    }  /* if (zfp.currentJobID > lastJobID) */
+                }  /* if (g_adaptiveMode) */
+            }  /* if (READY_FOR_UPDATE()) */
+        }  /* while ((inBuff.pos != inBuff.size) */
+    } while (directive != ZSTD_e_end);
+
+    if (ferror(srcFile)) {
+        EXM_THROW(26, "Read error : I/O error");
+    }
+    if (fileSize != UTIL_FILESIZE_UNKNOWN && *readsize != fileSize) {
+        EXM_THROW(27, "Read error : Incomplete read : %llu / %llu B",
+                (unsigned long long)*readsize, (unsigned long long)fileSize);
+    }
+
+    return compressedfilesize;
+}
+
 /*! FIO_compressFilename_internal() :
  *  same as FIO_compressFilename_extRess(), with `ress.desFile` already opened.
  *  @return : 0 : compression completed correctly,
  *            1 : missing or pb opening srcFileName
  */
-static int FIO_compressFilename_internal(cRess_t ress,
-                                         const char* dstFileName, const char* srcFileName, int compressionLevel)
+static int
+FIO_compressFilename_internal(cRess_t ress,
+                              const char* dstFileName, const char* srcFileName,
+                              int compressionLevel)
 {
-    FILE* const srcFile = ress.srcFile;
-    FILE* const dstFile = ress.dstFile;
     U64 readsize = 0;
     U64 compressedfilesize = 0;
     U64 const fileSize = UTIL_getFileSize(srcFileName);
-    ZSTD_EndDirective directive = ZSTD_e_continue;
     DISPLAYLEVEL(5, "%s: %u bytes \n", srcFileName, (U32)fileSize);
 
+    /* compression format selection */
     switch (g_compressionType) {
+        default:
         case FIO_zstdCompression:
+            compressedfilesize = FIO_compressZstdFrame(&ress, srcFileName, fileSize, compressionLevel, &readsize);
             break;
 
         case FIO_gzipCompression:
@@ -749,7 +1045,7 @@ static int FIO_compressFilename_internal(cRess_t ress,
             EXM_THROW(20, "zstd: %s: file cannot be compressed as gzip (zstd compiled without ZSTD_GZCOMPRESS) -- ignored \n",
                             srcFileName);
 #endif
-            goto finish;
+            break;
 
         case FIO_xzCompression:
         case FIO_lzmaCompression:
@@ -760,7 +1056,7 @@ static int FIO_compressFilename_internal(cRess_t ress,
             EXM_THROW(20, "zstd: %s: file cannot be compressed as xz/lzma (zstd compiled without ZSTD_LZMACOMPRESS) -- ignored \n",
                             srcFileName);
 #endif
-            goto finish;
+            break;
 
         case FIO_lz4Compression:
 #ifdef ZSTD_LZ4COMPRESS
@@ -770,62 +1066,14 @@ static int FIO_compressFilename_internal(cRess_t ress,
             EXM_THROW(20, "zstd: %s: file cannot be compressed as lz4 (zstd compiled without ZSTD_LZ4COMPRESS) -- ignored \n",
                             srcFileName);
 #endif
-            goto finish;
+            break;
     }
 
-    /* init */
-    if (fileSize != UTIL_FILESIZE_UNKNOWN)
-        ZSTD_CCtx_setPledgedSrcSize(ress.cctx, fileSize);
-
-    /* Main compression loop */
-    do {
-        size_t result;
-        /* Fill input Buffer */
-        size_t const inSize = fread(ress.srcBuffer, (size_t)1, ress.srcBufferSize, srcFile);
-        ZSTD_inBuffer inBuff = { ress.srcBuffer, inSize, 0 };
-        readsize += inSize;
-
-        if (inSize == 0 || (fileSize != UTIL_FILESIZE_UNKNOWN && readsize == fileSize))
-            directive = ZSTD_e_end;
-
-        result = 1;
-        while (inBuff.pos != inBuff.size || (directive == ZSTD_e_end && result != 0)) {
-            ZSTD_outBuffer outBuff = { ress.dstBuffer, ress.dstBufferSize, 0 };
-            CHECK_V(result, ZSTD_compress_generic(ress.cctx, &outBuff, &inBuff, directive));
-
-            /* Write compressed stream */
-            DISPLAYLEVEL(6, "ZSTD_compress_generic,ZSTD_e_continue: generated %u bytes \n",
-                            (U32)outBuff.pos);
-            if (outBuff.pos) {
-                size_t const sizeCheck = fwrite(ress.dstBuffer, 1, outBuff.pos, dstFile);
-                if (sizeCheck!=outBuff.pos)
-                    EXM_THROW(25, "Write error : cannot write compressed block into %s", dstFileName);
-                compressedfilesize += outBuff.pos;
-            }
-        }
-        if (g_nbThreads > 1) {
-            if (fileSize == UTIL_FILESIZE_UNKNOWN)
-                DISPLAYUPDATE(2, "\rRead : %u MB", (U32)(readsize>>20))
-            else
-                DISPLAYUPDATE(2, "\rRead : %u / %u MB",
-                                    (U32)(readsize>>20), (U32)(fileSize>>20));
-        } else {
-            if (fileSize == UTIL_FILESIZE_UNKNOWN)
-                DISPLAYUPDATE(2, "\rRead : %u MB ==> %.2f%%",
-                                (U32)(readsize>>20),
-                                (double)compressedfilesize/readsize*100)
-            else
-                DISPLAYUPDATE(2, "\rRead : %u / %u MB ==> %.2f%%",
-                                (U32)(readsize>>20), (U32)(fileSize>>20),
-                                (double)compressedfilesize/readsize*100);
-        }
-    } while (directive != ZSTD_e_end);
-
-finish:
     /* Status */
     DISPLAYLEVEL(2, "\r%79s\r", "");
-    DISPLAYLEVEL(2,"%-20s :%6.2f%%   (%6llu => %6llu bytes, %s) \n", srcFileName,
-        (double)compressedfilesize/(readsize+(!readsize) /* avoid div by zero */ )*100,
+    DISPLAYLEVEL(2,"%-20s :%6.2f%%   (%6llu => %6llu bytes, %s) \n",
+        srcFileName,
+        (double)compressedfilesize / (readsize+(!readsize)/*avoid div by zero*/) * 100,
         (unsigned long long)readsize, (unsigned long long) compressedfilesize,
          dstFileName);
 
@@ -833,14 +1081,80 @@ finish:
 }
 
 
+/*! FIO_compressFilename_dstFile() :
+ *  open dstFileName, or pass-through if ress.dstFile != NULL,
+ *  then start compression with FIO_compressFilename_internal().
+ *  Manages source removal (--rm) and file permissions transfer.
+ *  note : ress.srcFile must be != NULL,
+ *  so reach this function through FIO_compressFilename_srcFile().
+ *  @return : 0 : compression completed correctly,
+ *            1 : pb
+ */
+static int FIO_compressFilename_dstFile(cRess_t ress,
+                                        const char* dstFileName,
+                                        const char* srcFileName,
+                                        int compressionLevel)
+{
+    int closeDstFile = 0;
+    int result;
+    stat_t statbuf;
+    int transfer_permissions = 0;
+
+    assert(ress.srcFile != NULL);
+
+    if (ress.dstFile == NULL) {
+        closeDstFile = 1;
+        DISPLAYLEVEL(6, "FIO_compressFilename_dstFile: opening dst: %s", dstFileName);
+        ress.dstFile = FIO_openDstFile(dstFileName);
+        if (ress.dstFile==NULL) return 1;  /* could not open dstFileName */
+        /* Must only be added after FIO_openDstFile() succeeds.
+         * Otherwise we may delete the destination file if it already exists,
+         * and the user presses Ctrl-C when asked if they wish to overwrite.
+         */
+        addHandler(dstFileName);
+
+        if ( strcmp (srcFileName, stdinmark)
+          && UTIL_getFileStat(srcFileName, &statbuf))
+            transfer_permissions = 1;
+    }
+
+    result = FIO_compressFilename_internal(ress, dstFileName, srcFileName, compressionLevel);
+
+    if (closeDstFile) {
+        FILE* const dstFile = ress.dstFile;
+        ress.dstFile = NULL;
+
+        clearHandler();
+
+        if (fclose(dstFile)) { /* error closing dstFile */
+            DISPLAYLEVEL(1, "zstd: %s: %s \n", dstFileName, strerror(errno));
+            result=1;
+        }
+        if ( (result != 0)  /* operation failure */
+          && strcmp(dstFileName, nulmark)     /* special case : don't remove() /dev/null */
+          && strcmp(dstFileName, stdoutmark)  /* special case : don't remove() stdout */
+          ) {
+            FIO_remove(dstFileName); /* remove compression artefact; note don't do anything special if remove() fails */
+        } else if ( strcmp(dstFileName, stdoutmark)
+                 && strcmp(dstFileName, nulmark)
+                 && transfer_permissions) {
+            UTIL_setFileStat(dstFileName, &statbuf);
+        }
+    }
+
+    return result;
+}
+
+
 /*! FIO_compressFilename_srcFile() :
- *  note : ress.destFile already opened
  *  @return : 0 : compression completed correctly,
  *            1 : missing or pb opening srcFileName
  */
-static int FIO_compressFilename_srcFile(cRess_t ress,
-                            const char* dstFileName, const char* srcFileName,
-                            int compressionLevel)
+static int
+FIO_compressFilename_srcFile(cRess_t ress,
+                             const char* dstFileName,
+                             const char* srcFileName,
+                             int compressionLevel)
 {
     int result;
 
@@ -851,73 +1165,37 @@ static int FIO_compressFilename_srcFile(cRess_t ress,
     }
 
     ress.srcFile = FIO_openSrcFile(srcFileName);
-    if (!ress.srcFile) return 1;   /* srcFile could not be opened */
+    if (ress.srcFile == NULL) return 1;   /* srcFile could not be opened */
 
-    result = FIO_compressFilename_internal(ress, dstFileName, srcFileName, compressionLevel);
+    result = FIO_compressFilename_dstFile(ress, dstFileName, srcFileName, compressionLevel);
 
     fclose(ress.srcFile);
-    if (g_removeSrcFile /* --rm */ && !result && strcmp(srcFileName, stdinmark)) {
+    ress.srcFile = NULL;
+    if ( g_removeSrcFile   /* --rm */
+      && result == 0       /* success */
+      && strcmp(srcFileName, stdinmark)   /* exception : don't erase stdin */
+      ) {
         /* We must clear the handler, since after this point calling it would
          * delete both the source and destination files.
          */
         clearHandler();
-        if (remove(srcFileName))
+        if (FIO_remove(srcFileName))
             EXM_THROW(1, "zstd: %s: %s", srcFileName, strerror(errno));
     }
     return result;
 }
 
 
-/*! FIO_compressFilename_dstFile() :
- *  @return : 0 : compression completed correctly,
- *            1 : pb
- */
-static int FIO_compressFilename_dstFile(cRess_t ress,
-                                        const char* dstFileName,
-                                        const char* srcFileName,
-                                        int compressionLevel)
-{
-    int result;
-    stat_t statbuf;
-    int stat_result = 0;
-
-    ress.dstFile = FIO_openDstFile(dstFileName);
-    if (ress.dstFile==NULL) return 1;  /* could not open dstFileName */
-    /* Must ony be added after FIO_openDstFile() succeeds.
-     * Otherwise we may delete the destination file if at already exists, and
-     * the user presses Ctrl-C when asked if they wish to overwrite.
-     */
-    addHandler(dstFileName);
-
-    if (strcmp (srcFileName, stdinmark) && UTIL_getFileStat(srcFileName, &statbuf))
-        stat_result = 1;
-    result = FIO_compressFilename_srcFile(ress, dstFileName, srcFileName, compressionLevel);
-    clearHandler();
-
-    if (fclose(ress.dstFile)) { /* error closing dstFile */
-        DISPLAYLEVEL(1, "zstd: %s: %s \n", dstFileName, strerror(errno));
-        result=1;
-    }
-    if (result!=0) {  /* remove operation artefact */
-        if (remove(dstFileName))
-            EXM_THROW(1, "zstd: %s: %s", dstFileName, strerror(errno));
-    }
-    else if (strcmp (dstFileName, stdoutmark) && stat_result)
-        UTIL_setFileStat(dstFileName, &statbuf);
-
-    return result;
-}
-
-
 int FIO_compressFilename(const char* dstFileName, const char* srcFileName,
-                         const char* dictFileName, int compressionLevel, ZSTD_compressionParameters* comprParams)
+                         const char* dictFileName, int compressionLevel,
+                         ZSTD_compressionParameters comprParams)
 {
     clock_t const start = clock();
     U64 const fileSize = UTIL_getFileSize(srcFileName);
     U64 const srcSize = (fileSize == UTIL_FILESIZE_UNKNOWN) ? ZSTD_CONTENTSIZE_UNKNOWN : fileSize;
 
     cRess_t const ress = FIO_createCResources(dictFileName, compressionLevel, srcSize, comprParams);
-    int const result = FIO_compressFilename_dstFile(ress, dstFileName, srcFileName, compressionLevel);
+    int const result = FIO_compressFilename_srcFile(ress, dstFileName, srcFileName, compressionLevel);
 
     double const seconds = (double)(clock() - start) / CLOCKS_PER_SEC;
     DISPLAYLEVEL(4, "Completed in %.2f sec \n", seconds);
@@ -927,53 +1205,77 @@ int FIO_compressFilename(const char* dstFileName, const char* srcFileName,
 }
 
 
+/* FIO_determineCompressedName() :
+ * create a destination filename for compressed srcFileName.
+ * @return a pointer to it.
+ * This function never returns an error (it may abort() in case of pb)
+ */
+static const char*
+FIO_determineCompressedName(const char* srcFileName, const char* suffix)
+{
+    static size_t dfnbCapacity = 0;
+    static char* dstFileNameBuffer = NULL;   /* using static allocation : this function cannot be multi-threaded */
+
+    size_t const sfnSize = strlen(srcFileName);
+    size_t const suffixSize = strlen(suffix);
+
+    if (dfnbCapacity <= sfnSize+suffixSize+1) {
+        /* resize buffer for dstName */
+        free(dstFileNameBuffer);
+        dfnbCapacity = sfnSize + suffixSize + 30;
+        dstFileNameBuffer = (char*)malloc(dfnbCapacity);
+        if (!dstFileNameBuffer) {
+            EXM_THROW(30, "zstd: %s", strerror(errno));
+    }   }
+    assert(dstFileNameBuffer != NULL);
+    memcpy(dstFileNameBuffer, srcFileName, sfnSize);
+    memcpy(dstFileNameBuffer+sfnSize, suffix, suffixSize+1 /* Include terminating null */);
+
+    return dstFileNameBuffer;
+}
+
+
+/* FIO_compressMultipleFilenames() :
+ * compress nbFiles files
+ * into one destination (outFileName)
+ * or into one file each (outFileName == NULL, but suffix != NULL).
+ */
 int FIO_compressMultipleFilenames(const char** inFileNamesTable, unsigned nbFiles,
                                   const char* outFileName, const char* suffix,
                                   const char* dictFileName, int compressionLevel,
-                                  ZSTD_compressionParameters* comprParams)
+                                  ZSTD_compressionParameters comprParams)
 {
-    int missed_files = 0;
-    size_t dfnSize = FNSPACE;
-    char*  dstFileName = (char*)malloc(FNSPACE);
-    size_t const suffixSize = suffix ? strlen(suffix) : 0;
+    int error = 0;
     U64 const firstFileSize = UTIL_getFileSize(inFileNamesTable[0]);
     U64 const firstSrcSize = (firstFileSize == UTIL_FILESIZE_UNKNOWN) ? ZSTD_CONTENTSIZE_UNKNOWN : firstFileSize;
     U64 const srcSize = (nbFiles != 1) ? ZSTD_CONTENTSIZE_UNKNOWN : firstSrcSize ;
     cRess_t ress = FIO_createCResources(dictFileName, compressionLevel, srcSize, comprParams);
 
     /* init */
-    if (dstFileName==NULL)
-        EXM_THROW(27, "FIO_compressMultipleFilenames : allocation error for dstFileName");
-    if (outFileName == NULL && suffix == NULL)
-        EXM_THROW(28, "FIO_compressMultipleFilenames : dst unknown");  /* should never happen */
+    assert(outFileName != NULL || suffix != NULL);
 
-    /* loop on each file */
-    if (outFileName != NULL) {
-        unsigned u;
+    if (outFileName != NULL) {   /* output into a single destination (stdout typically) */
         ress.dstFile = FIO_openDstFile(outFileName);
-        for (u=0; u<nbFiles; u++)
-            missed_files += FIO_compressFilename_srcFile(ress, outFileName, inFileNamesTable[u], compressionLevel);
-        if (fclose(ress.dstFile))
-            EXM_THROW(29, "Write error : cannot properly close stdout");
+        if (ress.dstFile == NULL) {  /* could not open outFileName */
+            error = 1;
+        } else {
+            unsigned u;
+            for (u=0; u<nbFiles; u++)
+                error |= FIO_compressFilename_srcFile(ress, outFileName, inFileNamesTable[u], compressionLevel);
+            if (fclose(ress.dstFile))
+                EXM_THROW(29, "Write error : cannot properly close %s", outFileName);
+            ress.dstFile = NULL;
+        }
     } else {
         unsigned u;
         for (u=0; u<nbFiles; u++) {
-            size_t const ifnSize = strlen(inFileNamesTable[u]);
-            if (dfnSize <= ifnSize+suffixSize+1) {  /* resize name buffer */
-                free(dstFileName);
-                dfnSize = ifnSize + 20;
-                dstFileName = (char*)malloc(dfnSize);
-                if (!dstFileName) {
-                    EXM_THROW(30, "zstd: %s", strerror(errno));
-            }   }
-            strcpy(dstFileName, inFileNamesTable[u]);
-            strcat(dstFileName, suffix);
-            missed_files += FIO_compressFilename_dstFile(ress, dstFileName, inFileNamesTable[u], compressionLevel);
+            const char* const srcFileName = inFileNamesTable[u];
+            const char* const dstFileName = FIO_determineCompressedName(srcFileName, suffix);  /* cannot fail */
+            error |= FIO_compressFilename_srcFile(ress, dstFileName, srcFileName, compressionLevel);
     }   }
 
     FIO_freeCResources(ress);
-    free(dstFileName);
-    return missed_files;
+    return error;
 }
 
 #endif /* #ifndef ZSTD_NOCOMPRESS */
@@ -1134,33 +1436,46 @@ static unsigned FIO_passThrough(FILE* foutput, FILE* finput, void* buffer, size_
     return 0;
 }
 
-static void FIO_zstdErrorHelp(dRess_t* ress, size_t ret, char const* srcFileName)
+/* FIO_highbit64() :
+ * gives position of highest bit.
+ * note : only works for v > 0 !
+ */
+static unsigned FIO_highbit64(unsigned long long v)
+{
+    unsigned count = 0;
+    assert(v != 0);
+    v >>= 1;
+    while (v) { v >>= 1; count++; }
+    return count;
+}
+
+/* FIO_zstdErrorHelp() :
+ * detailed error message when requested window size is too large */
+static void FIO_zstdErrorHelp(dRess_t* ress, size_t err, char const* srcFileName)
 {
     ZSTD_frameHeader header;
-    /* No special help for these errors */
-    if (ZSTD_getErrorCode(ret) != ZSTD_error_frameParameter_windowTooLarge)
+
+    /* Help message only for one specific error */
+    if (ZSTD_getErrorCode(err) != ZSTD_error_frameParameter_windowTooLarge)
         return;
+
     /* Try to decode the frame header */
-    ret = ZSTD_getFrameHeader(&header, ress->srcBuffer, ress->srcBufferLoaded);
-    if (ret == 0) {
-        U32 const windowSize = (U32)header.windowSize;
-        U32 const windowLog = BIT_highbit32(windowSize) + ((windowSize & (windowSize - 1)) != 0);
-        U32 const windowMB = (windowSize >> 20) + ((windowSize & ((1 MB) - 1)) != 0);
-        assert(header.windowSize <= (U64)((U32)-1));
+    err = ZSTD_getFrameHeader(&header, ress->srcBuffer, ress->srcBufferLoaded);
+    if (err == 0) {
+        unsigned long long const windowSize = header.windowSize;
+        U32 const windowLog = FIO_highbit64(windowSize) + ((windowSize & (windowSize - 1)) != 0);
         assert(g_memLimit > 0);
         DISPLAYLEVEL(1, "%s : Window size larger than maximum : %llu > %u\n",
-                        srcFileName, header.windowSize, g_memLimit);
+                        srcFileName, windowSize, g_memLimit);
         if (windowLog <= ZSTD_WINDOWLOG_MAX) {
+            U32 const windowMB = (U32)((windowSize >> 20) + ((windowSize & ((1 MB) - 1)) != 0));
+            assert(windowSize < (U64)(1ULL << 52));   /* ensure now overflow for windowMB */
             DISPLAYLEVEL(1, "%s : Use --long=%u or --memory=%uMB\n",
                             srcFileName, windowLog, windowMB);
             return;
         }
-    } else if (ZSTD_getErrorCode(ret) != ZSTD_error_frameParameter_windowTooLarge) {
-        DISPLAYLEVEL(1, "%s : Error decoding frame header to read window size : %s\n",
-                        srcFileName, ZSTD_getErrorName(ret));
-        return;
     }
-    DISPLAYLEVEL(1, "%s : Window log larger than ZSTD_WINDOWLOG_MAX=%u not supported\n",
+    DISPLAYLEVEL(1, "%s : Window log larger than ZSTD_WINDOWLOG_MAX=%u; not supported\n",
                     srcFileName, ZSTD_WINDOWLOG_MAX);
 }
 
@@ -1168,7 +1483,7 @@ static void FIO_zstdErrorHelp(dRess_t* ress, size_t ret, char const* srcFileName
  *  @return : size of decoded zstd frame, or an error code
 */
 #define FIO_ERROR_FRAME_DECODING   ((unsigned long long)(-2))
-unsigned long long FIO_decompressZstdFrame(dRess_t* ress,
+static unsigned long long FIO_decompressZstdFrame(dRess_t* ress,
                                        FILE* finput,
                                        const char* srcFileName,
                                        U64 alreadyDecoded)
@@ -1421,7 +1736,7 @@ static unsigned long long FIO_decompressLz4Frame(dRess_t* ress,
             if (LZ4F_isError(nextToLoad)) {
                 DISPLAYLEVEL(1, "zstd: %s: lz4 decompression error : %s \n",
                                 srcFileName, LZ4F_getErrorName(nextToLoad));
-                decodingError = 1; break;
+                decodingError = 1; nextToLoad = 0; break;
             }
             pos += remaining;
 
@@ -1429,7 +1744,7 @@ static unsigned long long FIO_decompressLz4Frame(dRess_t* ress,
             if (decodedBytes) {
                 if (fwrite(ress->dstBuffer, 1, decodedBytes, ress->dstFile) != decodedBytes) {
                     DISPLAYLEVEL(1, "zstd: %s \n", strerror(errno));
-                    decodingError = 1; break;
+                    decodingError = 1; nextToLoad = 0; break;
                 }
                 filesize += decodedBytes;
                 DISPLAYUPDATE(2, "\rDecompressed : %u MB  ", (unsigned)(filesize>>20));
@@ -1538,11 +1853,71 @@ static int FIO_decompressFrames(dRess_t ress, FILE* srcFile,
     return 0;
 }
 
+/** FIO_decompressDstFile() :
+    open `dstFileName`,
+    or path-through if ress.dstFile is already != 0,
+    then start decompression process (FIO_decompressFrames()).
+    @return : 0 : OK
+              1 : operation aborted
+*/
+static int FIO_decompressDstFile(dRess_t ress, FILE* srcFile,
+                                 const char* dstFileName, const char* srcFileName)
+{
+    int result;
+    stat_t statbuf;
+    int transfer_permissions = 0;
+    int releaseDstFile = 0;
+
+    if (ress.dstFile == NULL) {
+        releaseDstFile = 1;
+
+        ress.dstFile = FIO_openDstFile(dstFileName);
+        if (ress.dstFile==0) return 1;
+
+        /* Must only be added after FIO_openDstFile() succeeds.
+         * Otherwise we may delete the destination file if it already exists,
+         * and the user presses Ctrl-C when asked if they wish to overwrite.
+         */
+        addHandler(dstFileName);
+
+        if ( strcmp(srcFileName, stdinmark)   /* special case : don't transfer permissions from stdin */
+          && UTIL_getFileStat(srcFileName, &statbuf) )
+            transfer_permissions = 1;
+    }
+
+
+    result = FIO_decompressFrames(ress, srcFile, dstFileName, srcFileName);
+
+    if (releaseDstFile) {
+        FILE* const dstFile = ress.dstFile;
+        clearHandler();
+        ress.dstFile = NULL;
+        if (fclose(dstFile)) {
+            DISPLAYLEVEL(1, "zstd: %s: %s \n", dstFileName, strerror(errno));
+            result = 1;
+        }
+
+        if ( (result != 0)  /* operation failure */
+          && strcmp(dstFileName, nulmark)     /* special case : don't remove() /dev/null (#316) */
+          && strcmp(dstFileName, stdoutmark)  /* special case : don't remove() stdout */
+          ) {
+            FIO_remove(dstFileName);  /* remove decompression artefact; note: don't do anything special if remove() fails */
+        } else {  /* operation success */
+            if ( strcmp(dstFileName, stdoutmark) /* special case : don't chmod stdout */
+              && strcmp(dstFileName, nulmark)    /* special case : don't chmod /dev/null */
+              && transfer_permissions )          /* file permissions correctly extracted from src */
+                UTIL_setFileStat(dstFileName, &statbuf);  /* transfer file permissions from src into dst */
+        }
+    }
+
+    return result;
+}
+
 
 /** FIO_decompressSrcFile() :
-    Decompression `srcFileName` into `ress.dstFile`
+    Open `srcFileName`, transfer control to decompressDstFile()
     @return : 0 : OK
-              1 : operation not started
+              1 : error
 */
 static int FIO_decompressSrcFile(dRess_t ress, const char* dstFileName, const char* srcFileName)
 {
@@ -1556,22 +1931,23 @@ static int FIO_decompressSrcFile(dRess_t ress, const char* dstFileName, const ch
 
     srcFile = FIO_openSrcFile(srcFileName);
     if (srcFile==NULL) return 1;
+    ress.srcBufferLoaded = 0;
 
-    result = FIO_decompressFrames(ress, srcFile, dstFileName, srcFileName);
+    result = FIO_decompressDstFile(ress, srcFile, dstFileName, srcFileName);
 
     /* Close file */
     if (fclose(srcFile)) {
         DISPLAYLEVEL(1, "zstd: %s: %s \n", srcFileName, strerror(errno));  /* error should not happen */
         return 1;
     }
-    if ( g_removeSrcFile /* --rm */
-      && (result==0)     /* decompression successful */
+    if ( g_removeSrcFile  /* --rm */
+      && (result==0)      /* decompression successful */
       && strcmp(srcFileName, stdinmark) ) /* not stdin */ {
         /* We must clear the handler, since after this point calling it would
          * delete both the source and destination files.
          */
         clearHandler();
-        if (remove(srcFileName)) {
+        if (FIO_remove(srcFileName)) {
             /* failed to remove src file */
             DISPLAYLEVEL(1, "zstd: %s: %s \n", srcFileName, strerror(errno));
             return 1;
@@ -1580,73 +1956,94 @@ static int FIO_decompressSrcFile(dRess_t ress, const char* dstFileName, const ch
 }
 
 
-/** FIO_decompressFile_extRess() :
-    decompress `srcFileName` into `dstFileName`
-    @return : 0 : OK
-              1 : operation aborted (src not available, dst already taken, etc.)
-*/
-static int FIO_decompressDstFile(dRess_t ress,
-                                 const char* dstFileName, const char* srcFileName)
-{
-    int result;
-    stat_t statbuf;
-    int stat_result = 0;
-
-    ress.dstFile = FIO_openDstFile(dstFileName);
-    if (ress.dstFile==0) return 1;
-    /* Must ony be added after FIO_openDstFile() succeeds.
-     * Otherwise we may delete the destination file if at already exists, and
-     * the user presses Ctrl-C when asked if they wish to overwrite.
-     */
-    addHandler(dstFileName);
-
-    if ( strcmp(srcFileName, stdinmark)
-      && UTIL_getFileStat(srcFileName, &statbuf) )
-        stat_result = 1;
-    result = FIO_decompressSrcFile(ress, dstFileName, srcFileName);
-    clearHandler();
-
-    if (fclose(ress.dstFile)) {
-        DISPLAYLEVEL(1, "zstd: %s: %s \n", dstFileName, strerror(errno));
-        result = 1;
-    }
-
-    if ( (result != 0)  /* operation failure */
-      && strcmp(dstFileName, nulmark)      /* special case : don't remove() /dev/null (#316) */
-      && strcmp(dstFileName, stdoutmark) ) /* special case : don't remove() stdout */
-        remove(dstFileName);  /* remove decompression artefact; note don't do anything special if remove() fails */
-    else {  /* operation success */
-        if ( strcmp(dstFileName, stdoutmark) /* special case : don't chmod stdout */
-          && strcmp(dstFileName, nulmark)    /* special case : don't chmod /dev/null */
-          && stat_result )                   /* file permissions correctly extracted from src */
-            UTIL_setFileStat(dstFileName, &statbuf);  /* transfer file permissions from src into dst */
-    }
-
-    signal(SIGINT, SIG_DFL);
-
-    return result;
-}
-
 
 int FIO_decompressFilename(const char* dstFileName, const char* srcFileName,
                            const char* dictFileName)
 {
     dRess_t const ress = FIO_createDResources(dictFileName);
 
-    int const decodingError = FIO_decompressDstFile(ress, dstFileName, srcFileName);
+    int const decodingError = FIO_decompressSrcFile(ress, dstFileName, srcFileName);
 
     FIO_freeDResources(ress);
     return decodingError;
 }
 
 
-#define MAXSUFFIXSIZE 8
-int FIO_decompressMultipleFilenames(const char** srcNamesTable, unsigned nbFiles,
-                                    const char* outFileName,
-                                    const char* dictFileName)
+/* FIO_determineDstName() :
+ * create a destination filename from a srcFileName.
+ * @return a pointer to it.
+ * @return == NULL if there is an error */
+static const char*
+FIO_determineDstName(const char* srcFileName)
 {
-    int skippedFiles = 0;
-    int missingFiles = 0;
+    static size_t dfnbCapacity = 0;
+    static char* dstFileNameBuffer = NULL;   /* using static allocation : this function cannot be multi-threaded */
+
+    size_t const sfnSize = strlen(srcFileName);
+    size_t suffixSize;
+    const char* const suffixPtr = strrchr(srcFileName, '.');
+    if (suffixPtr == NULL) {
+        DISPLAYLEVEL(1, "zstd: %s: unknown suffix -- ignored \n",
+                        srcFileName);
+        return NULL;
+    }
+    suffixSize = strlen(suffixPtr);
+
+    /* check suffix is authorized */
+    if (sfnSize <= suffixSize
+        || (   strcmp(suffixPtr, ZSTD_EXTENSION)
+        #ifdef ZSTD_GZDECOMPRESS
+            && strcmp(suffixPtr, GZ_EXTENSION)
+        #endif
+        #ifdef ZSTD_LZMADECOMPRESS
+            && strcmp(suffixPtr, XZ_EXTENSION)
+            && strcmp(suffixPtr, LZMA_EXTENSION)
+        #endif
+        #ifdef ZSTD_LZ4DECOMPRESS
+            && strcmp(suffixPtr, LZ4_EXTENSION)
+        #endif
+            ) ) {
+        const char* suffixlist = ZSTD_EXTENSION
+        #ifdef ZSTD_GZDECOMPRESS
+            "/" GZ_EXTENSION
+        #endif
+        #ifdef ZSTD_LZMADECOMPRESS
+            "/" XZ_EXTENSION "/" LZMA_EXTENSION
+        #endif
+        #ifdef ZSTD_LZ4DECOMPRESS
+            "/" LZ4_EXTENSION
+        #endif
+        ;
+        DISPLAYLEVEL(1, "zstd: %s: unknown suffix (%s expected) -- ignored \n",
+                     srcFileName, suffixlist);
+        return NULL;
+    }
+
+    /* allocate enough space to write dstFilename into it */
+    if (dfnbCapacity+suffixSize <= sfnSize+1) {
+        free(dstFileNameBuffer);
+        dfnbCapacity = sfnSize + 20;
+        dstFileNameBuffer = (char*)malloc(dfnbCapacity);
+        if (dstFileNameBuffer==NULL)
+            EXM_THROW(74, "not enough memory for dstFileName");
+    }
+
+    /* return dst name == src name truncated from suffix */
+    assert(dstFileNameBuffer != NULL);
+    memcpy(dstFileNameBuffer, srcFileName, sfnSize - suffixSize);
+    dstFileNameBuffer[sfnSize-suffixSize] = '\0';
+    return dstFileNameBuffer;
+
+    /* note : dstFileNameBuffer memory is not going to be free */
+}
+
+
+int
+FIO_decompressMultipleFilenames(const char* srcNamesTable[], unsigned nbFiles,
+                                const char* outFileName,
+                                const char* dictFileName)
+{
+    int error = 0;
     dRess_t ress = FIO_createDResources(dictFileName);
 
     if (outFileName) {
@@ -1654,55 +2051,22 @@ int FIO_decompressMultipleFilenames(const char** srcNamesTable, unsigned nbFiles
         ress.dstFile = FIO_openDstFile(outFileName);
         if (ress.dstFile == 0) EXM_THROW(71, "cannot open %s", outFileName);
         for (u=0; u<nbFiles; u++)
-            missingFiles += FIO_decompressSrcFile(ress, outFileName, srcNamesTable[u]);
+            error |= FIO_decompressSrcFile(ress, outFileName, srcNamesTable[u]);
         if (fclose(ress.dstFile))
             EXM_THROW(72, "Write error : cannot properly close output file");
     } else {
-        size_t suffixSize;
-        size_t dfnSize = FNSPACE;
         unsigned u;
-        char* dstFileName = (char*)malloc(FNSPACE);
-        if (dstFileName==NULL)
-            EXM_THROW(73, "not enough memory for dstFileName");
         for (u=0; u<nbFiles; u++) {   /* create dstFileName */
             const char* const srcFileName = srcNamesTable[u];
-            const char* const suffixPtr = strrchr(srcFileName, '.');
-            size_t const sfnSize = strlen(srcFileName);
-            if (!suffixPtr) {
-                DISPLAYLEVEL(1, "zstd: %s: unknown suffix -- ignored \n",
-                                srcFileName);
-                skippedFiles++;
-                continue;
-            }
-            suffixSize = strlen(suffixPtr);
-            if (dfnSize+suffixSize <= sfnSize+1) {
-                free(dstFileName);
-                dfnSize = sfnSize + 20;
-                dstFileName = (char*)malloc(dfnSize);
-                if (dstFileName==NULL)
-                    EXM_THROW(74, "not enough memory for dstFileName");
-            }
-            if (sfnSize <= suffixSize
-                || (strcmp(suffixPtr, GZ_EXTENSION)
-                    && strcmp(suffixPtr, XZ_EXTENSION)
-                    && strcmp(suffixPtr, ZSTD_EXTENSION)
-                    && strcmp(suffixPtr, LZMA_EXTENSION)
-                    && strcmp(suffixPtr, LZ4_EXTENSION)) ) {
-                DISPLAYLEVEL(1, "zstd: %s: unknown suffix (%s/%s/%s/%s/%s expected) -- ignored \n",
-                             srcFileName, GZ_EXTENSION, XZ_EXTENSION, ZSTD_EXTENSION, LZMA_EXTENSION, LZ4_EXTENSION);
-                skippedFiles++;
-                continue;
-            } else {
-                memcpy(dstFileName, srcFileName, sfnSize - suffixSize);
-                dstFileName[sfnSize-suffixSize] = '\0';
-            }
-            missingFiles += FIO_decompressDstFile(ress, dstFileName, srcFileName);
+            const char* const dstFileName = FIO_determineDstName(srcFileName);
+            if (dstFileName == NULL) { error=1; continue; }
+
+            error |= FIO_decompressSrcFile(ress, dstFileName, srcFileName);
         }
-        free(dstFileName);
     }
 
     FIO_freeDResources(ress);
-    return missingFiles + skippedFiles;
+    return error;
 }
 
 
@@ -1722,22 +2086,19 @@ typedef struct {
     U32 nbFiles;
 } fileInfo_t;
 
-/** getFileInfo() :
- *  Reads information from file, stores in *info
- * @return : 0 if successful
- *           1 for frame analysis error
- *           2 for file not compressed with zstd
- *           3 for cases in which file could not be opened.
- */
-static int getFileInfo_fileConfirmed(fileInfo_t* info, const char* inFileName){
-    int detectError = 0;
-    FILE* const srcFile = FIO_openSrcFile(inFileName);
-    if (srcFile == NULL) {
-        DISPLAY("Error: could not open source file %s\n", inFileName);
-        return 3;
-    }
-    info->compressedSize = UTIL_getFileSize(inFileName);
+typedef enum { info_success=0, info_frame_error=1, info_not_zstd=2, info_file_error=3 } InfoError;
 
+#define ERROR_IF(c,n,...) {             \
+    if (c) {                           \
+        DISPLAYLEVEL(1, __VA_ARGS__);  \
+        DISPLAYLEVEL(1, " \n");        \
+        return n;                      \
+    }                                  \
+}
+
+static InfoError
+FIO_analyzeFrames(fileInfo_t* info, FILE* const srcFile)
+{
     /* begin analyzing frame */
     for ( ; ; ) {
         BYTE headerBuffer[ZSTD_FRAMEHEADERSIZE_MAX];
@@ -1747,130 +2108,111 @@ static int getFileInfo_fileConfirmed(fileInfo_t* info, const char* inFileName){
               && (numBytesRead == 0)
               && (info->compressedSize > 0)
               && (info->compressedSize != UTIL_FILESIZE_UNKNOWN) ) {
-                break;
+                break;  /* correct end of file => success */
             }
-            else if (feof(srcFile)) {
-                DISPLAY("Error: reached end of file with incomplete frame\n");
-                detectError = 2;
-                break;
-            }
-            else {
-                DISPLAY("Error: did not reach end of file but ran out of frames\n");
-                detectError = 1;
-                break;
-            }
+            ERROR_IF(feof(srcFile), info_not_zstd, "Error: reached end of file with incomplete frame");
+            ERROR_IF(1, info_frame_error, "Error: did not reach end of file but ran out of frames");
         }
         {   U32 const magicNumber = MEM_readLE32(headerBuffer);
             /* Zstandard frame */
             if (magicNumber == ZSTD_MAGICNUMBER) {
                 ZSTD_frameHeader header;
                 U64 const frameContentSize = ZSTD_getFrameContentSize(headerBuffer, numBytesRead);
-                if (frameContentSize == ZSTD_CONTENTSIZE_ERROR || frameContentSize == ZSTD_CONTENTSIZE_UNKNOWN) {
+                if ( frameContentSize == ZSTD_CONTENTSIZE_ERROR
+                  || frameContentSize == ZSTD_CONTENTSIZE_UNKNOWN ) {
                     info->decompUnavailable = 1;
                 } else {
                     info->decompressedSize += frameContentSize;
                 }
-                if (ZSTD_getFrameHeader(&header, headerBuffer, numBytesRead) != 0) {
-                    DISPLAY("Error: could not decode frame header\n");
-                    detectError = 1;
-                    break;
-                }
+                ERROR_IF(ZSTD_getFrameHeader(&header, headerBuffer, numBytesRead) != 0,
+                        info_frame_error, "Error: could not decode frame header");
                 info->windowSize = header.windowSize;
                 /* move to the end of the frame header */
                 {   size_t const headerSize = ZSTD_frameHeaderSize(headerBuffer, numBytesRead);
-                    if (ZSTD_isError(headerSize)) {
-                        DISPLAY("Error: could not determine frame header size\n");
-                        detectError = 1;
-                        break;
-                    }
-                    {   int const ret = fseek(srcFile, ((long)headerSize)-((long)numBytesRead), SEEK_CUR);
-                        if (ret != 0) {
-                            DISPLAY("Error: could not move to end of frame header\n");
-                            detectError = 1;
-                            break;
-                }   }   }
+                    ERROR_IF(ZSTD_isError(headerSize), info_frame_error, "Error: could not determine frame header size");
+                    ERROR_IF(fseek(srcFile, ((long)headerSize)-((long)numBytesRead), SEEK_CUR) != 0,
+                            info_frame_error, "Error: could not move to end of frame header");
+                }
 
-                /* skip the rest of the blocks in the frame */
+                /* skip all blocks in the frame */
                 {   int lastBlock = 0;
                     do {
                         BYTE blockHeaderBuffer[3];
-                        size_t const readBytes = fread(blockHeaderBuffer, 1, 3, srcFile);
-                        if (readBytes != 3) {
-                            DISPLAY("There was a problem reading the block header\n");
-                            detectError = 1;
-                            break;
-                        }
+                        ERROR_IF(fread(blockHeaderBuffer, 1, 3, srcFile) != 3,
+                                info_frame_error, "Error while reading block header");
                         {   U32 const blockHeader = MEM_readLE24(blockHeaderBuffer);
                             U32 const blockTypeID = (blockHeader >> 1) & 3;
                             U32 const isRLE = (blockTypeID == 1);
                             U32 const isWrongBlock = (blockTypeID == 3);
                             long const blockSize = isRLE ? 1 : (long)(blockHeader >> 3);
-                            if (isWrongBlock) {
-                                DISPLAY("Error: unsupported block type \n");
-                                detectError = 1;
-                                break;
-                            }
+                            ERROR_IF(isWrongBlock, info_frame_error, "Error: unsupported block type");
                             lastBlock = blockHeader & 1;
-                            {   int const ret = fseek(srcFile, blockSize, SEEK_CUR);
-                                if (ret != 0) {
-                                    DISPLAY("Error: could not skip to end of block\n");
-                                    detectError = 1;
-                                    break;
-                        }   }   }
+                            ERROR_IF(fseek(srcFile, blockSize, SEEK_CUR) != 0,
+                                    info_frame_error, "Error: could not skip to end of block");
+                        }
                     } while (lastBlock != 1);
-
-                    if (detectError) break;
                 }
 
                 /* check if checksum is used */
                 {   BYTE const frameHeaderDescriptor = headerBuffer[4];
                     int const contentChecksumFlag = (frameHeaderDescriptor & (1 << 2)) >> 2;
                     if (contentChecksumFlag) {
-                        int const ret = fseek(srcFile, 4, SEEK_CUR);
                         info->usesCheck = 1;
-                        if (ret != 0) {
-                            DISPLAY("Error: could not skip past checksum\n");
-                            detectError = 1;
-                            break;
-                }   }   }
+                        ERROR_IF(fseek(srcFile, 4, SEEK_CUR) != 0,
+                                info_frame_error, "Error: could not skip past checksum");
+                }   }
                 info->numActualFrames++;
             }
             /* Skippable frame */
             else if ((magicNumber & 0xFFFFFFF0U) == ZSTD_MAGIC_SKIPPABLE_START) {
                 U32 const frameSize = MEM_readLE32(headerBuffer + 4);
                 long const seek = (long)(8 + frameSize - numBytesRead);
-                int const ret = LONG_SEEK(srcFile, seek, SEEK_CUR);
-                if (ret != 0) {
-                    DISPLAY("Error: could not find end of skippable frame\n");
-                    detectError = 1;
-                    break;
-                }
+                ERROR_IF(LONG_SEEK(srcFile, seek, SEEK_CUR) != 0,
+                        info_frame_error, "Error: could not find end of skippable frame");
                 info->numSkippableFrames++;
             }
             /* unknown content */
             else {
-                detectError = 2;
-                break;
+                return info_not_zstd;
             }
-        }
-    }  /* end analyzing frame */
-    fclose(srcFile);
-    info->nbFiles = 1;
-    return detectError;
+        }  /* magic number analysis */
+    }  /* end analyzing frames */
+    return info_success;
 }
 
-static int getFileInfo(fileInfo_t* info, const char* srcFileName)
+
+static InfoError
+getFileInfo_fileConfirmed(fileInfo_t* info, const char* inFileName)
 {
-    int const isAFile = UTIL_isRegularFile(srcFileName);
-    if (!isAFile) {
-        DISPLAY("Error : %s is not a file", srcFileName);
-        return 3;
-    }
+    InfoError status;
+    FILE* const srcFile = FIO_openSrcFile(inFileName);
+    ERROR_IF(srcFile == NULL, info_file_error, "Error: could not open source file %s", inFileName);
+
+    info->compressedSize = UTIL_getFileSize(inFileName);
+    status = FIO_analyzeFrames(info, srcFile);
+
+    fclose(srcFile);
+    info->nbFiles = 1;
+    return status;
+}
+
+
+/** getFileInfo() :
+ *  Reads information from file, stores in *info
+ * @return : InfoError status
+ */
+static InfoError
+getFileInfo(fileInfo_t* info, const char* srcFileName)
+{
+    ERROR_IF(!UTIL_isRegularFile(srcFileName),
+            info_file_error, "Error : %s is not a file", srcFileName);
     return getFileInfo_fileConfirmed(info, srcFileName);
 }
 
 
-static void displayInfo(const char* inFileName, const fileInfo_t* info, int displayLevel){
+static void
+displayInfo(const char* inFileName, const fileInfo_t* info, int displayLevel)
+{
     unsigned const unit = info->compressedSize < (1 MB) ? (1 KB) : (1 MB);
     const char* const unitStr = info->compressedSize < (1 MB) ? "KB" : "MB";
     double const windowSizeUnit = (double)info->windowSize / unit;
@@ -1917,6 +2259,7 @@ static void displayInfo(const char* inFileName, const fileInfo_t* info, int disp
 static fileInfo_t FIO_addFInfo(fileInfo_t fi1, fileInfo_t fi2)
 {
     fileInfo_t total;
+    memset(&total, 0, sizeof(total));
     total.numActualFrames = fi1.numActualFrames + fi2.numActualFrames;
     total.numSkippableFrames = fi1.numSkippableFrames + fi2.numSkippableFrames;
     total.compressedSize = fi1.compressedSize + fi2.compressedSize;
@@ -1927,46 +2270,62 @@ static fileInfo_t FIO_addFInfo(fileInfo_t fi1, fileInfo_t fi2)
     return total;
 }
 
-static int FIO_listFile(fileInfo_t* total, const char* inFileName, int displayLevel){
+static int
+FIO_listFile(fileInfo_t* total, const char* inFileName, int displayLevel)
+{
     fileInfo_t info;
     memset(&info, 0, sizeof(info));
-    {   int const error = getFileInfo(&info, inFileName);
-        if (error == 1) {
+    {   InfoError const error = getFileInfo(&info, inFileName);
+        if (error == info_frame_error) {
             /* display error, but provide output */
-            DISPLAY("An error occurred while getting file info \n");
+            DISPLAYLEVEL(1, "Error while parsing %s \n", inFileName);
         }
-        else if (error == 2) {
+        else if (error == info_not_zstd) {
             DISPLAYOUT("File %s not compressed by zstd \n", inFileName);
             if (displayLevel > 2) DISPLAYOUT("\n");
             return 1;
         }
-        else if (error == 3) {
+        else if (error == info_file_error) {
             /* error occurred while opening the file */
             if (displayLevel > 2) DISPLAYOUT("\n");
             return 1;
         }
         displayInfo(inFileName, &info, displayLevel);
         *total = FIO_addFInfo(*total, info);
+        assert(error>=0 || error<=1);
         return error;
     }
 }
 
-int FIO_listMultipleFiles(unsigned numFiles, const char** filenameTable, int displayLevel){
+int FIO_listMultipleFiles(unsigned numFiles, const char** filenameTable, int displayLevel)
+{
+    /* ensure no specified input is stdin (needs fseek() capability) */
+    {   unsigned u;
+        for (u=0; u<numFiles;u++) {
+            ERROR_IF(!strcmp (filenameTable[u], stdinmark),
+                    1, "zstd: --list does not support reading from standard input");
+    }   }
+
     if (numFiles == 0) {
-        DISPLAYOUT("No files given\n");
-        return 0;
+        if (!IS_CONSOLE(stdin)) {
+            DISPLAYLEVEL(1, "zstd: --list does not support reading from standard input \n");
+        }
+        DISPLAYLEVEL(1, "No files given \n");
+        return 1;
     }
+
     if (displayLevel <= 2) {
         DISPLAYOUT("Frames  Skips  Compressed  Uncompressed  Ratio  Check  Filename\n");
     }
     {   int error = 0;
-        unsigned u;
         fileInfo_t total;
         memset(&total, 0, sizeof(total));
         total.usesCheck = 1;
-        for (u=0; u<numFiles;u++) {
-            error |= FIO_listFile(&total, filenameTable[u], displayLevel);
-        }
+        /* --list each file, and check for any error */
+        {   unsigned u;
+            for (u=0; u<numFiles;u++) {
+                error |= FIO_listFile(&total, filenameTable[u], displayLevel);
+        }   }
         if (numFiles > 1 && displayLevel <= 2) {   /* display total */
             unsigned const unit = total.compressedSize < (1 MB) ? (1 KB) : (1 MB);
             const char* const unitStr = total.compressedSize < (1 MB) ? "KB" : "MB";

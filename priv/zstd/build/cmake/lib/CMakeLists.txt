@@ -14,7 +14,7 @@ OPTION(ZSTD_BUILD_STATIC "BUILD STATIC LIBRARIES" ON)
 OPTION(ZSTD_BUILD_SHARED "BUILD SHARED LIBRARIES" ON)
 
 IF(NOT ZSTD_BUILD_SHARED AND NOT ZSTD_BUILD_STATIC)
-    MESSAGE(SEND_ERROR "You need to build at least one flavor of libstd")
+    MESSAGE(SEND_ERROR "You need to build at least one flavor of libzstd")
 ENDIF()
 
 # Define library directory, where sources and header files are located
@@ -24,7 +24,7 @@ INCLUDE_DIRECTORIES(${LIBRARY_DIR} ${LIBRARY_DIR}/common)
 # Parse version
 INCLUDE(GetZstdLibraryVersion)
 GetZstdLibraryVersion(${LIBRARY_DIR}/zstd.h LIBVER_MAJOR LIBVER_MINOR LIBVER_RELEASE)
-MESSAGE("ZSTD VERSION ${LIBVER_MAJOR}.${LIBVER_MINOR}.${LIBVER_RELEASE}")
+MESSAGE(STATUS "ZSTD VERSION ${LIBVER_MAJOR}.${LIBVER_MINOR}.${LIBVER_RELEASE}")
 
 SET(Sources
         ${LIBRARY_DIR}/common/entropy_common.c
@@ -34,6 +34,7 @@ SET(Sources
         ${LIBRARY_DIR}/common/zstd_common.c
         ${LIBRARY_DIR}/common/error_private.c
         ${LIBRARY_DIR}/common/xxhash.c
+        ${LIBRARY_DIR}/compress/hist.c
         ${LIBRARY_DIR}/compress/fse_compress.c
         ${LIBRARY_DIR}/compress/huf_compress.c
         ${LIBRARY_DIR}/compress/zstd_compress.c
@@ -46,6 +47,7 @@ SET(Sources
         ${LIBRARY_DIR}/decompress/huf_decompress.c
         ${LIBRARY_DIR}/decompress/zstd_decompress.c
         ${LIBRARY_DIR}/dictBuilder/cover.c
+        ${LIBRARY_DIR}/dictBuilder/fastcover.c
         ${LIBRARY_DIR}/dictBuilder/divsufsort.c
         ${LIBRARY_DIR}/dictBuilder/zdict.c
         ${LIBRARY_DIR}/deprecated/zbuff_common.c
@@ -54,6 +56,7 @@ SET(Sources
 
 SET(Headers
         ${LIBRARY_DIR}/zstd.h
+        ${LIBRARY_DIR}/common/debug.h
         ${LIBRARY_DIR}/common/pool.h
         ${LIBRARY_DIR}/common/threading.h
         ${LIBRARY_DIR}/common/bitstream.h
@@ -63,6 +66,7 @@ SET(Headers
         ${LIBRARY_DIR}/common/huf.h
         ${LIBRARY_DIR}/common/mem.h
         ${LIBRARY_DIR}/common/zstd_internal.h
+        ${LIBRARY_DIR}/compress/hist.h
         ${LIBRARY_DIR}/compress/zstd_compress_internal.h
         ${LIBRARY_DIR}/compress/zstd_fast.h
         ${LIBRARY_DIR}/compress/zstd_double_fast.h
@@ -71,6 +75,7 @@ SET(Headers
         ${LIBRARY_DIR}/compress/zstd_ldm.h
         ${LIBRARY_DIR}/compress/zstdmt_compress.h
         ${LIBRARY_DIR}/dictBuilder/zdict.h
+        ${LIBRARY_DIR}/dictBuilder/cover.h
         ${LIBRARY_DIR}/deprecated/zbuff.h)
 
 IF (ZSTD_LEGACY_SUPPORT)
@@ -105,9 +110,21 @@ ENDIF (MSVC)
 # Split project to static and shared libraries build
 IF (ZSTD_BUILD_SHARED)
     ADD_LIBRARY(libzstd_shared SHARED ${Sources} ${Headers} ${PlatformDependResources})
+    IF (ZSTD_MULTITHREAD_SUPPORT)
+        SET_PROPERTY(TARGET libzstd_shared APPEND PROPERTY COMPILE_DEFINITIONS "ZSTD_MULTITHREAD")
+        IF (UNIX)
+            TARGET_LINK_LIBRARIES(libzstd_shared ${THREADS_LIBS})
+        ENDIF ()
+    ENDIF()
 ENDIF (ZSTD_BUILD_SHARED)
 IF (ZSTD_BUILD_STATIC)
     ADD_LIBRARY(libzstd_static STATIC ${Sources} ${Headers})
+    IF (ZSTD_MULTITHREAD_SUPPORT)
+        SET_PROPERTY(TARGET libzstd_static APPEND PROPERTY COMPILE_DEFINITIONS "ZSTD_MULTITHREAD")
+        IF (UNIX)
+            TARGET_LINK_LIBRARIES(libzstd_static ${THREADS_LIBS})
+        ENDIF ()
+    ENDIF ()
 ENDIF (ZSTD_BUILD_STATIC)
 
 # Add specific compile definitions for MSVC project
@@ -146,7 +163,7 @@ ENDIF (ZSTD_BUILD_STATIC)
 IF (UNIX)
     # pkg-config
     SET(PREFIX "${CMAKE_INSTALL_PREFIX}")
-    SET(LIBDIR "${CMAKE_INSTALL_PREFIX}/lib")
+    SET(LIBDIR "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}")
     SET(INCLUDEDIR "${CMAKE_INSTALL_PREFIX}/include")
     SET(VERSION "${LIBVER_MAJOR}.${LIBVER_MINOR}.${LIBVER_RELEASE}")
     ADD_CUSTOM_TARGET(libzstd.pc ALL
@@ -155,7 +172,7 @@ IF (UNIX)
             -P "${CMAKE_CURRENT_SOURCE_DIR}/pkgconfig.cmake"
             COMMENT "Creating pkg-config file")
 
-    INSTALL(FILES "${CMAKE_CURRENT_BINARY_DIR}/libzstd.pc" DESTINATION "share/pkgconfig")
+    INSTALL(FILES "${CMAKE_CURRENT_BINARY_DIR}/libzstd.pc" DESTINATION "${LIBDIR}/pkgconfig")
 ENDIF (UNIX)
 
 # install target
@@ -163,14 +180,17 @@ INSTALL(FILES
     ${LIBRARY_DIR}/zstd.h
     ${LIBRARY_DIR}/deprecated/zbuff.h
     ${LIBRARY_DIR}/dictBuilder/zdict.h
+    ${LIBRARY_DIR}/dictBuilder/cover.h
     ${LIBRARY_DIR}/common/zstd_errors.h
     DESTINATION "include")
 
 IF (ZSTD_BUILD_SHARED)
-    INSTALL(TARGETS libzstd_shared RUNTIME DESTINATION "bin" LIBRARY DESTINATION "lib" ARCHIVE DESTINATION "lib")
+    INSTALL(TARGETS libzstd_shared RUNTIME DESTINATION "bin"
+                                   LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+                                   ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}")
 ENDIF()
 IF (ZSTD_BUILD_STATIC)
-    INSTALL(TARGETS libzstd_static ARCHIVE DESTINATION "lib")
+    INSTALL(TARGETS libzstd_static ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}")
 ENDIF (ZSTD_BUILD_STATIC)
 
 # uninstall target
